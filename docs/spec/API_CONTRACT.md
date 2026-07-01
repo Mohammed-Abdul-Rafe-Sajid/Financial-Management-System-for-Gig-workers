@@ -39,6 +39,12 @@ Authorization: Bearer <JWT access token>
 **Standard error codes** (use exactly these strings):
 `VALIDATION_ERROR`, `UNAUTHENTICATED`, `FORBIDDEN`, `NOT_FOUND`, `SESSION_NOT_FOUND`, `USER_NOT_FOUND`, `OTP_INVALID`, `OTP_EXPIRED`, `RATE_LIMITED`, `INSUFFICIENT_DATA`, `ENRICHMENT_FAILED`, `INTERNAL_ERROR`
 
+## Internal service-to-service auth
+All internal endpoints (marked "service-to-service only") require:
+  Header: Authorization: Bearer <SERVICE_SECRET>
+Where SERVICE_SECRET is the shared env var defined in .env.example.
+This is distinct from user JWTs — internal calls use the static secret, not a user token.
+
 ---
 
 ## §1. user-service
