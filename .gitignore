@@ -1,0 +1,50 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# JWT keys — NEVER commit
+infra/keys/
+
+# Node
+node_modules/
+dist/
+.next/
+build/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ML model artifacts (large binary files — use a model registry in production)
+ml/models/*.joblib
+ml/models/*.pkl
+ml/models/*.h5
+apps/prediction-service/models/*.joblib
+
+# Docker
+.docker/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Test coverage
+coverage/
+.coverage
+htmlcov/

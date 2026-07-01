@@ -1,0 +1,527 @@
+# =============================================================================
+# docker-compose.yml — GigFinance AI Local Development Environment
+# =============================================================================
+# Usage: docker-compose up --build
+# All services start in dependency order. See README.md for full setup guide.
+# =============================================================================
+
+version: "3.9"
+
+# ─── Shared network ──────────────────────────────────────────────────────────
+networks:
+  gigfinance-net:
+    driver: bridge
+
+# ─── Named volumes ───────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+  mongodb_data:
+  redis_data:
+  zookeeper_data:
+  zookeeper_log:
+  kafka_data:
+
+# =============================================================================
+# SERVICES
+# =============================================================================
+services:
+
+  # ─── PostgreSQL ─────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: gigfinance-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: gigfinance
+      POSTGRES_USER: gigfinance
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gigfinance_dev_secret}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro   # runs DB_SCHEMA.sql on first boot
+    networks:
+      - gigfinance-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gigfinance -d gigfinance"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ─── MongoDB ─────────────────────────────────────────────────────────────────
+  mongodb:
+    image: mongo:7
+    container_name: gigfinance-mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: gigfinance
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-gigfinance_dev_secret}
+      MONGO_INITDB_DATABASE: gigfinance_chat
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - gigfinance-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ─── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: gigfinance-redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD:-gigfinance_dev_secret} --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - gigfinance-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-gigfinance_dev_secret}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Zookeeper (Kafka dependency) ────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: gigfinance-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
+    networks:
+      - gigfinance-net
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ─── Kafka ───────────────────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: gigfinance-kafka
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Internal = container-to-container, External = host machine
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168  # 7 days
+      KAFKA_MESSAGE_MAX_BYTES: 1048576  # 1MB
+    ports:
+      - "9092:9092"    # external (host access)
+      - "29092:29092"  # internal (container-to-container)
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - gigfinance-net
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:29092"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ─── Kafka Topic Init (one-shot) ─────────────────────────────────────────────
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: gigfinance-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      "
+      echo 'Creating Kafka topics...'
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic session.created --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic session.enriched --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic prediction.requested --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic iss.recompute.requested --partitions 1 --replication-factor 1
+      echo 'Kafka topics created.'
+      "
+    networks:
+      - gigfinance-net
+    restart: on-failure
+
+  # ─── user-service (Node.js, port 3001) ───────────────────────────────────────
+  user-service:
+    build:
+      context: ./apps/user-service
+      dockerfile: Dockerfile
+    container_name: gigfinance-user-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      PORT: 3001
+      SERVICE_NAME: user-service
+      SERVICE_VERSION: 1.0.0
+      DATABASE_URL: postgresql://gigfinance:${POSTGRES_PASSWORD:-gigfinance_dev_secret}@postgres:5432/gigfinance
+      REDIS_URL: redis://:${REDIS_PASSWORD:-gigfinance_dev_secret}@redis:6379
+      JWT_PRIVATE_KEY_PATH: /run/secrets/jwt_private_key
+      JWT_PUBLIC_KEY_PATH: /run/secrets/jwt_public_key
+      JWT_ACCESS_EXPIRY_SECONDS: 900
+      JWT_REFRESH_EXPIRY_SECONDS: 604800
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN}
+      TWILIO_FROM_NUMBER: ${TWILIO_FROM_NUMBER}
+      OTP_EXPIRY_SECONDS: 300
+      OTP_MAX_ATTEMPTS: 5
+      OTP_WINDOW_SECONDS: 900
+      SERVICE_SECRET: ${SERVICE_SECRET:-dev_service_secret_change_in_prod}
+    ports:
+      - "3001:3001"
+    networks:
+      - gigfinance-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3001/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ─── session-service (Node.js, port 3002) ────────────────────────────────────
+  session-service:
+    build:
+      context: ./apps/session-service
+      dockerfile: Dockerfile
+    container_name: gigfinance-session-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      user-service:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      PORT: 3002
+      SERVICE_NAME: session-service
+      SERVICE_VERSION: 1.0.0
+      DATABASE_URL: postgresql://gigfinance:${POSTGRES_PASSWORD:-gigfinance_dev_secret}@postgres:5432/gigfinance
+      KAFKA_BROKERS: kafka:29092
+      KAFKA_CLIENT_ID: session-service
+      JWT_PUBLIC_KEY_PATH: /run/secrets/jwt_public_key
+      USER_SERVICE_URL: http://user-service:3001
+      SERVICE_SECRET: ${SERVICE_SECRET:-dev_service_secret_change_in_prod}
+    ports:
+      - "3002:3002"
+    networks:
+      - gigfinance-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3002/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ─── enrichment-service (Python, port 3003 health only) ──────────────────────
+  enrichment-service:
+    build:
+      context: ./apps/enrichment-service
+      dockerfile: Dockerfile
+    container_name: gigfinance-enrichment-service
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      session-service:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: kafka:29092
+      KAFKA_CLIENT_ID: enrichment-service
+      KAFKA_CONSUMER_GROUP: enrichment-service-consumer-group
+      REDIS_URL: redis://:${REDIS_PASSWORD:-gigfinance_dev_secret}@redis:6379
+      SESSION_SERVICE_URL: http://session-service:3002
+      OPENWEATHERMAP_API_KEY: ${OPENWEATHERMAP_API_KEY}
+      GOOGLE_MAPS_API_KEY: ${GOOGLE_MAPS_API_KEY}
+      SERVICE_SECRET: ${SERVICE_SECRET:-dev_service_secret_change_in_prod}
+      MAX_CONCURRENT_ENRICHMENTS: 20
+      HEALTH_PORT: 3003
+    ports:
+      - "3003:3003"
+    networks:
+      - gigfinance-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3003/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ─── expense-service (Node.js, port 3004) ────────────────────────────────────
+  expense-service:
+    build:
+      context: ./apps/expense-service
+      dockerfile: Dockerfile
+    container_name: gigfinance-expense-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      user-service:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      PORT: 3004
+      SERVICE_NAME: expense-service
+      SERVICE_VERSION: 1.0.0
+      DATABASE_URL: postgresql://gigfinance:${POSTGRES_PASSWORD:-gigfinance_dev_secret}@postgres:5432/gigfinance
+      JWT_PUBLIC_KEY_PATH: /run/secrets/jwt_public_key
+      SERVICE_SECRET: ${SERVICE_SECRET:-dev_service_secret_change_in_prod}
+    ports:
+      - "3004:3004"
+    networks:
+      - gigfinance-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3004/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ─── prediction-service (Python/FastAPI, port 8001) ──────────────────────────
+  prediction-service:
+    build:
+      context: ./apps/prediction-service
+      dockerfile: Dockerfile
+    container_name: gigfinance-prediction-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      session-service:
+        condition: service_healthy
+    environment:
+      PORT: 8001
+      SERVICE_NAME: prediction-service
+      SERVICE_VERSION: 1.0.0
+      DATABASE_URL: postgresql://gigfinance:${POSTGRES_PASSWORD:-gigfinance_dev_secret}@postgres:5432/gigfinance
+      REDIS_URL: redis://:${REDIS_PASSWORD:-gigfinance_dev_secret}@redis:6379
+      SESSION_SERVICE_URL: http://session-service:3002
+      JWT_PUBLIC_KEY_PATH: /run/secrets/jwt_public_key
+      SERVICE_SECRET: ${SERVICE_SECRET:-dev_service_secret_change_in_prod}
+      MODEL_GENERIC_PATH: /app/models/generic_model.joblib
+      MODEL_VERSION: 1.0.0
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./ml/models:/app/models:ro   # mount trained model artifacts
+    networks:
+      - gigfinance-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8001/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 45s  # longer: model loading takes time
+
+  # ─── iss-service (Python/FastAPI, port 8002) ──────────────────────────────────
+  iss-service:
+    build:
+      context: ./apps/iss-service
+      dockerfile: Dockerfile
+    container_name: gigfinance-iss-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      session-service:
+        condition: service_healthy
+      expense-service:
+        condition: service_healthy
+    environment:
+      PORT: 8002
+      SERVICE_NAME: iss-service
+      SERVICE_VERSION: 1.0.0
+      DATABASE_URL: postgresql://gigfinance:${POSTGRES_PASSWORD:-gigfinance_dev_secret}@postgres:5432/gigfinance
+      SESSION_SERVICE_URL: http://session-service:3002
+      EXPENSE_SERVICE_URL: http://expense-service:3004
+      JWT_PUBLIC_KEY_PATH: /run/secrets/jwt_public_key
+      SERVICE_SECRET: ${SERVICE_SECRET:-dev_service_secret_change_in_prod}
+    ports:
+      - "8002:8002"
+    networks:
+      - gigfinance-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8002/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ─── chatbot-service (Python/FastAPI, port 8003) ──────────────────────────────
+  chatbot-service:
+    build:
+      context: ./apps/chatbot-service
+      dockerfile: Dockerfile
+    container_name: gigfinance-chatbot-service
+    restart: unless-stopped
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    environment:
+      PORT: 8003
+      SERVICE_NAME: chatbot-service
+      SERVICE_VERSION: 1.0.0
+      MONGODB_URL: mongodb://gigfinance:${MONGO_PASSWORD:-gigfinance_dev_secret}@mongodb:27017/gigfinance_chat?authSource=admin
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      PINECONE_API_KEY: ${PINECONE_API_KEY}
+      PINECONE_INDEX_NAME: gigfinance-knowledge-base
+      JWT_PUBLIC_KEY_PATH: /run/secrets/jwt_public_key
+      SERVICE_SECRET: ${SERVICE_SECRET:-dev_service_secret_change_in_prod}
+    ports:
+      - "8003:8003"
+    networks:
+      - gigfinance-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8003/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ─── analytics-service (Python/FastAPI, port 8004) ───────────────────────────
+  analytics-service:
+    build:
+      context: ./apps/analytics-service
+      dockerfile: Dockerfile
+    container_name: gigfinance-analytics-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      PORT: 8004
+      SERVICE_NAME: analytics-service
+      SERVICE_VERSION: 1.0.0
+      DATABASE_URL: postgresql://gigfinance:${POSTGRES_PASSWORD:-gigfinance_dev_secret}@postgres:5432/gigfinance
+      REDIS_URL: redis://:${REDIS_PASSWORD:-gigfinance_dev_secret}@redis:6379
+      KAFKA_BROKERS: kafka:29092
+      KAFKA_CLIENT_ID: analytics-service
+      KAFKA_CONSUMER_GROUP: analytics-service-consumer-group
+      JWT_PUBLIC_KEY_PATH: /run/secrets/jwt_public_key
+      ANALYTICS_CACHE_TTL_SECONDS: 300
+      SERVICE_SECRET: ${SERVICE_SECRET:-dev_service_secret_change_in_prod}
+    ports:
+      - "8004:8004"
+    networks:
+      - gigfinance-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8004/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ─── api-gateway (Node.js/Express, port 3000) ────────────────────────────────
+  api-gateway:
+    build:
+      context: ./apps/api-gateway
+      dockerfile: Dockerfile
+    container_name: gigfinance-api-gateway
+    restart: unless-stopped
+    depends_on:
+      user-service:
+        condition: service_healthy
+      session-service:
+        condition: service_healthy
+      expense-service:
+        condition: service_healthy
+      prediction-service:
+        condition: service_healthy
+      iss-service:
+        condition: service_healthy
+      chatbot-service:
+        condition: service_healthy
+      analytics-service:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      SERVICE_NAME: api-gateway
+      SERVICE_VERSION: 1.0.0
+      REDIS_URL: redis://:${REDIS_PASSWORD:-gigfinance_dev_secret}@redis:6379
+      JWT_PUBLIC_KEY_PATH: /run/secrets/jwt_public_key
+      # Downstream service URLs
+      USER_SERVICE_URL: http://user-service:3001
+      SESSION_SERVICE_URL: http://session-service:3002
+      EXPENSE_SERVICE_URL: http://expense-service:3004
+      PREDICTION_SERVICE_URL: http://prediction-service:8001
+      ISS_SERVICE_URL: http://iss-service:8002
+      CHATBOT_SERVICE_URL: http://chatbot-service:8003
+      ANALYTICS_SERVICE_URL: http://analytics-service:8004
+      # Rate limiting
+      RATE_LIMIT_WINDOW_MS: 60000
+      RATE_LIMIT_MAX_REQUESTS: 100
+      CORS_ALLOWED_ORIGINS: http://localhost:3100,http://localhost:3000
+    ports:
+      - "3000:3000"
+    networks:
+      - gigfinance-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ─── web frontend (Next.js, port 3100) ───────────────────────────────────────
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+    container_name: gigfinance-web
+    restart: unless-stopped
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      NEXT_PUBLIC_API_URL: http://localhost:3000
+      NEXT_PUBLIC_APP_NAME: GigFinance AI
+    ports:
+      - "3100:3100"
+    networks:
+      - gigfinance-net
