@@ -381,8 +381,8 @@ This is distinct from user JWTs — internal calls use the static secret, not a 
 ---
 
 ## Next service to build? Check off here as each is completed:
-- [ ] user-service
-- [ ] session-service
+- [x] user-service
+- [x] session-service
 - [ ] enrichment-service
 - [ ] prediction-service
 - [ ] iss-service
